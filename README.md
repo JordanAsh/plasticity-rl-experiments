@@ -150,17 +150,6 @@ All from seed 42 RL run (435 steps), evaluated on GSM8K test (1,319) and MATH te
 
 (Constant-LR runs in progress.)
 
-### Observations
-
-- **pass@16 is remarkably flat** across all models (~93–95% GSM8K, ~77–80% MATH).
-  The base of solvable problems is similar across training conditions.
-- **Greedy varies dramatically.** RL produces a much sharper policy than SFT on the
-  same correct trajectories.
-- **Data order matters more at low LR.** With lr=1e-5, ordered SFT beats shuffled
-  by 14.5 points on GSM8K greedy. At lr=5e-5 and 1e-4, the gap shrinks.
-- **lr=5e-5 is the sweet spot** for SFT — best greedy without hurting pass@16 or MATH.
-- **lr=1e-4 hurts MATH** greedy by ~5 points while pass@16 also dips slightly.
-
 ### Reproducing the table
 
 Each `summary.json` in `results/{greedy,pass16}/<model>/` contains the accuracy
