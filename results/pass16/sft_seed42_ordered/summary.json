@@ -1,0 +1,14 @@
+{
+  "model": "sft_outputs/seed42_ordered",
+  "n": 16,
+  "k": 16,
+  "temperature": 0.8,
+  "gsm8k": {
+    "pass@16": 93.10083396512509,
+    "total": 1319
+  },
+  "math": {
+    "pass@16": 78.94,
+    "total": 5000
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "model": "sft_outputs/seed42_shuffled",
+  "gsm8k": {
+    "accuracy": 57.543593631539046,
+    "total": 1319
+  },
+  "math": {
+    "accuracy": 53.879999999999995,
+    "total": 5000
+  }
+}

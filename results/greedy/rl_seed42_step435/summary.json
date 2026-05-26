@@ -1,0 +1,11 @@
+{
+  "model": "checkpoints/rl_seed42_step435_merged",
+  "gsm8k": {
+    "accuracy": 80.13646702047005,
+    "total": 1319
+  },
+  "math": {
+    "accuracy": 57.02,
+    "total": 5000
+  }
+}

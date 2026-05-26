@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# Logs and outputs
+*.log
+outputs/
+wandb/
+
+# Large artifacts (not tracked in git)
+checkpoints/
+sft_outputs/
+generation_logs/
+
+# Detail dumps (only summary.json is tracked)
+results/**/gsm8k_details.json
+results/**/math_details.json

@@ -1,0 +1,14 @@
+{
+  "model": "checkpoints/rl_seed42_step435_merged",
+  "n": 16,
+  "k": 16,
+  "temperature": 0.8,
+  "gsm8k": {
+    "pass@16": 92.72175890826384,
+    "total": 1319
+  },
+  "math": {
+    "pass@16": 78.34,
+    "total": 5000
+  }
+}
