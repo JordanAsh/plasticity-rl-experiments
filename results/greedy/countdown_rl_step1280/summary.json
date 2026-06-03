@@ -1,0 +1,7 @@
+{
+  "model": "checkpoints/rl_countdown_step1280_merged",
+  "accuracy": 41.69921875,
+  "format_only": 58.30078125,
+  "no_answer": 0.0,
+  "total": 1024
+}

@@ -88,12 +88,17 @@ def parse_args():
     # ordering
     p.add_argument("--ordered", action="store_true",
                     help="Train on positives in step order (default: shuffled)")
+    p.add_argument("--score_threshold", type=float, default=0.0,
+                    help="Only keep generations with score strictly greater than this (default 0.0)")
     p.add_argument("--num_epochs", type=int, default=1)
     return p.parse_args()
 
 
-def load_positives(logs_dir: str) -> list[dict]:
-    """Load all positive generations from JSONL files, preserving step order."""
+def load_positives(logs_dir: str, score_threshold: float = 0.0) -> list[dict]:
+    """Load positive generations from JSONL files, preserving step order.
+
+    A generation is "positive" if its score > score_threshold.
+    """
     positives = []
     files = sorted(
         [f for f in os.listdir(logs_dir) if f.endswith(".jsonl")],
@@ -108,7 +113,7 @@ def load_positives(logs_dir: str) -> list[dict]:
         with open(os.path.join(logs_dir, fname)) as fh:
             for line_idx, line in enumerate(fh):
                 record = json.loads(line)
-                if record["score"] <= 0:
+                if record["score"] <= score_threshold:
                     continue
                 inp = record["input"]
                 # Validate the expected template structure
@@ -252,7 +257,7 @@ def main():
 
     # ---------- load data ----------
     log(f"Loading positives from {args.generation_logs_dir} ...")
-    positives = load_positives(args.generation_logs_dir)
+    positives = load_positives(args.generation_logs_dir, score_threshold=args.score_threshold)
     log(f"  Total positives: {len(positives):,}")
 
     if not args.ordered:

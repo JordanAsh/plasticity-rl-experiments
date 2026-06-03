@@ -93,11 +93,11 @@ def main():
         dtype="bfloat16",
     )
 
-    # Greedy decoding — matches verl's val_kwargs
     sampling_params = SamplingParams(
         temperature=0,
         top_p=1.0,
         max_tokens=args.max_new_tokens,
+        stop_token_ids=[tokenizer.convert_tokens_to_ids("<|im_end|>")],
     )
 
     results_summary = {}

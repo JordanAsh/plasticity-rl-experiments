@@ -1,0 +1,7 @@
+{
+  "model": "sft_outputs/countdown_ordered_lr1e5",
+  "accuracy": 42.96875,
+  "format_only": 57.03125,
+  "no_answer": 0.0,
+  "total": 1024
+}

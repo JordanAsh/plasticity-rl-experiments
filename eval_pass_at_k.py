@@ -101,6 +101,7 @@ def main():
         top_p=args.top_p,
         max_tokens=args.max_new_tokens,
         n=args.n,
+        stop_token_ids=[tokenizer.convert_tokens_to_ids("<|im_end|>")],
     )
 
     results_summary = {}

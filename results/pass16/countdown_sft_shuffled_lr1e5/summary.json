@@ -1,0 +1,8 @@
+{
+  "model": "sft_outputs/countdown_shuffled_lr1e5",
+  "n": 16,
+  "k": 16,
+  "temperature": 0.8,
+  "pass@16": 46.484375,
+  "total": 1024
+}

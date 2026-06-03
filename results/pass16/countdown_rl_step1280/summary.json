@@ -1,0 +1,8 @@
+{
+  "model": "checkpoints/rl_countdown_step1280_merged",
+  "n": 16,
+  "k": 16,
+  "temperature": 0.8,
+  "pass@16": 41.9921875,
+  "total": 1024
+}
