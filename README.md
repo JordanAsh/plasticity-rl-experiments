@@ -177,22 +177,6 @@ responses) from the corresponding RL run, one epoch.
 | SFT shuffled lr=1e-5 cosine | 33.6%        | **57.3%**    |
 | SFT ordered  lr=1e-5 cosine | 35.6%        | 52.1%        |
 
-### Observations
-
-- **pass@16 is mostly flat** across training conditions for any (task, model size)
-  pair. The set of solvable problems doesn't change much.
-- **Greedy varies a lot.** RL sharpens the policy onto a high-confidence mode; SFT
-  preserves more of the distribution.
-- On **familiar tasks (GSM8K, MATH)**, RL wins greedy decisively.
-- On **novel tasks (Countdown, KK)**, SFT matches or beats RL on greedy at 1.5B.
-- The "RL collapses diversity" effect (`pass@16 ≈ greedy`) is strongest at 1.5B on
-  KK (Δ=+1.6 for RL vs Δ=+4.1 for SFT-shuffled). At 3B it becomes much clearer:
-  RL Δ=+11.6, SFT-shuffled Δ=+23.7.
-- **Data order matters more at low LR.** With lr=1e-5 on GSM8K+MATH, ordered SFT
-  beats shuffled by 14.5 points on GSM8K greedy. At lr=5e-5 and 1e-4, the gap shrinks.
-- **lr=5e-5 is the sweet spot** for SFT on GSM8K+MATH — best greedy without hurting
-  pass@16 or MATH greedy.
-
 ## Training hyperparameters
 
 All RL runs use **GRPO** (`algorithm.adv_estimator=grpo`, `kl_loss_type=low_var_kl`,
