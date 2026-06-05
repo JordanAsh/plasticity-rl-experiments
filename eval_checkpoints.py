@@ -55,8 +55,6 @@ from tqdm import tqdm
 # Reuse helpers from run_sft.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_sft import (  # noqa: E402
-    INPUT_PREFIX,
-    INPUT_SUFFIX,
     SFTDataset,
     collate_fn,
     load_positives,
@@ -114,6 +112,11 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--overwrite", action="store_true",
                    help="Recompute even if eval_metrics.json already exists for a checkpoint.")
+    # multi-GPU parallel eval: contiguously slice the checkpoint list across ranks
+    p.add_argument("--rank", type=int, default=0,
+                   help="This worker's index when running multi-GPU parallel eval (0..world_size-1).")
+    p.add_argument("--world_size", type=int, default=1,
+                   help="Total number of parallel eval workers (default 1 = no slicing).")
     return p.parse_args()
 
 
@@ -643,6 +646,21 @@ def main():
         raise RuntimeError(f"No checkpoints found under {args.run_dir}/checkpoints/")
     print(f"Will evaluate {len(ckpts)} checkpoints: {[s for s, _ in ckpts]}")
 
+    # ---------- multi-GPU parallel slicing ----------
+    predecessor_ckpt = None
+    if args.world_size > 1:
+        n = len(ckpts)
+        lo = args.rank * n // args.world_size
+        hi = (args.rank + 1) * n // args.world_size
+        if lo > 0:
+            predecessor_ckpt = ckpts[lo - 1]
+        ckpts = ckpts[lo:hi]
+        print(f"  [rank {args.rank}/{args.world_size}] my slice: steps {[s for s, _ in ckpts]}"
+              + (f" (predecessor for KL: step {predecessor_ckpt[0]})" if predecessor_ckpt else ""))
+        if not ckpts:
+            print("  Empty slice for this rank; nothing to do.")
+            return
+
     if not args.skip_old_data:
         entries = merge_manifests(args.run_dir)
         seen_per_ckpt = cumulative_seen_per_checkpoint(entries, [s for s, _ in ckpts])
@@ -656,6 +674,14 @@ def main():
     # ---------- iterate checkpoints ----------
     prev_model = None
     prev_step = None
+    # If we're a non-leading rank, preload the predecessor checkpoint as prev_model
+    # so the KL_prev chain stays correct across rank boundaries.
+    if predecessor_ckpt is not None and not args.skip_kl:
+        pstep, pdir = predecessor_ckpt
+        psub = os.path.join(pdir, "model") if os.path.isdir(os.path.join(pdir, "model")) else pdir
+        print(f"  [rank {args.rank}] preloading predecessor step {pstep} as prev_model ...")
+        prev_model = load_model(psub, dtype, device)
+        prev_step = pstep
     for step, ckpt_dir in ckpts:
         out_path = os.path.join(ckpt_dir, "eval_metrics.json")
         if os.path.exists(out_path) and not args.overwrite:
