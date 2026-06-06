@@ -83,6 +83,10 @@ def parse_args():
     # What to evaluate
     p.add_argument("--skip_probe", action="store_true")
     p.add_argument("--skip_old_data", action="store_true")
+    p.add_argument("--old_data_step_stride", type=int, default=0,
+                   help="If > 0, only include old-data samples from training steps that are multiples "
+                        "of this stride (e.g. 50 or 100). Keeps later-checkpoint old-data eval bounded "
+                        "and gives every checkpoint a uniformly-spaced slice of its own history.")
     p.add_argument("--skip_kl", action="store_true",
                    help="Skip KL-from-init and KL-from-prev-ckpt.")
     p.add_argument("--skip_dead_units", action="store_true")
@@ -159,15 +163,21 @@ def merge_manifests(run_dir: str) -> list[dict]:
     return entries
 
 
-def cumulative_seen_per_checkpoint(entries: list[dict], ckpt_steps: list[int]) -> dict[int, set]:
-    """For each checkpoint step, return the set of sample_ids seen up to and including it."""
+def cumulative_seen_per_checkpoint(entries: list[dict], ckpt_steps: list[int],
+                                   step_stride: int = 0) -> dict[int, set]:
+    """For each checkpoint step, return the set of sample_ids seen up to and including it.
+
+    If step_stride > 0, only entries whose global_step is a multiple of step_stride contribute,
+    yielding a deterministic uniformly-spaced subsample of training history.
+    """
     out: dict[int, set] = {}
     ckpt_steps_sorted = sorted(ckpt_steps)
     ci = 0
     running: set = set()
     for e in entries:
-        for mb in e["micro_batches"]:
-            running.update(mb["sample_ids"])
+        if step_stride <= 0 or (e["global_step"] % step_stride == 0):
+            for mb in e["micro_batches"]:
+                running.update(mb["sample_ids"])
         while ci < len(ckpt_steps_sorted) and e["global_step"] >= ckpt_steps_sorted[ci]:
             out[ckpt_steps_sorted[ci]] = set(running)
             ci += 1
@@ -663,7 +673,12 @@ def main():
 
     if not args.skip_old_data:
         entries = merge_manifests(args.run_dir)
-        seen_per_ckpt = cumulative_seen_per_checkpoint(entries, [s for s, _ in ckpts])
+        seen_per_ckpt = cumulative_seen_per_checkpoint(
+            entries, [s for s, _ in ckpts], step_stride=args.old_data_step_stride,
+        )
+        if args.old_data_step_stride > 0:
+            sizes = {s: len(seen_per_ckpt.get(s, set())) for s, _ in ckpts}
+            print(f"  Old-data step stride = {args.old_data_step_stride}; per-ckpt sizes: {sizes}")
 
     # ---------- init model (kept loaded for KL-from-init) ----------
     init_model = None
@@ -735,7 +750,10 @@ def main():
         if full_sft_ds is not None and not args.skip_old_data:
             seen = seen_per_ckpt.get(step, set())
             old_indices = [i for i, it in enumerate(full_sft_ds.items) if it["sample_id"] in seen]
-            print(f"  old data size = {len(old_indices)} (cumulative @ step {step})")
+            if args.old_data_step_stride > 0:
+                print(f"  old data size = {len(old_indices)} (stride={args.old_data_step_stride} @ step {step})")
+            else:
+                print(f"  old data size = {len(old_indices)} (cumulative @ step {step})")
             if old_indices:
                 old_subset = Subset(full_sft_ds, old_indices)
                 # Subset doesn't expose .items / .eos_ids; expose via attributes for grad helper.
@@ -764,6 +782,7 @@ def main():
                     )
                 result["old_data"] = old_metrics
                 result["old_data_size"] = len(old_indices)
+                result["old_data_step_stride"] = args.old_data_step_stride
                 print(f"  old:   loss={old_metrics['loss']:.4f} ent={old_metrics['token_entropy']:.3f}"
                       + (f" kl_init={old_metrics.get('kl_from_init', float('nan')):.4e}" if "kl_from_init" in old_metrics else "")
                       + (f" kl_prev={old_metrics.get('kl_from_previous_checkpoint', float('nan')):.4e}" if "kl_from_previous_checkpoint" in old_metrics else "")

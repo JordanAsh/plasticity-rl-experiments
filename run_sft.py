@@ -119,7 +119,14 @@ def parse_args():
                     help="Save optimizer.pt and scheduler.pt at each checkpoint.")
     p.add_argument("--snapshot_dtype", type=str, default="float32",
                     choices=["float32", "bfloat16", "float16"],
-                    help="Dtype for the on-GPU init/prev parameter snapshots used for norm metrics.")
+                    help="Dtype for the init/prev parameter snapshots used for norm metrics.")
+    p.add_argument("--snapshot_device", type=str, default="cuda",
+                    choices=["cuda", "cpu"],
+                    help="Where to keep the rank-0 init/prev snapshots. 'cpu' uses pinned host memory, "
+                         "freeing ~2x model_size on GPU rank 0 (recommended for 3B+).")
+    p.add_argument("--metrics_log_every", type=int, default=1,
+                    help="Compute parameter-norm metrics every N optimizer steps (default 1). "
+                         "Only the norm metrics are gated; loss/entropy/grad_norm are still per-step.")
     # resume
     p.add_argument("--resume_from", type=str, default=None,
                     help="Path to a checkpoint dir (e.g. <output_dir>/checkpoints/step_100) "
@@ -309,9 +316,20 @@ def all_reduce_scalars(values: dict) -> dict:
     return {k: t[i].item() for i, k in enumerate(keys)}
 
 
-def snapshot_params(model: torch.nn.Module, dtype: torch.dtype) -> list[torch.Tensor]:
-    """Clone model params (in order of parameters()) into a list on the same device."""
-    return [p.detach().to(dtype=dtype).clone() for p in model.parameters()]
+def snapshot_params(model: torch.nn.Module, dtype: torch.dtype,
+                    device: torch.device | str | None = None,
+                    pin_memory: bool = False) -> list[torch.Tensor]:
+    """Clone model params (in order of parameters()) into a list. By default lives on the same device.
+    If `device='cpu'` and `pin_memory=True`, snapshots are placed in pinned host memory for fast H2D."""
+    out = []
+    for p in model.parameters():
+        t = p.detach().to(dtype=dtype).clone()
+        if device is not None and torch.device(device) != t.device:
+            t = t.to(device=device)
+        if pin_memory and t.device.type == "cpu":
+            t = t.pin_memory()
+        out.append(t)
+    return out
 
 
 @torch.no_grad()
@@ -324,17 +342,28 @@ def param_l2_norm(params: list[torch.Tensor]) -> float:
 
 @torch.no_grad()
 def param_diff_l2_norm(params_a, params_b) -> float:
-    sq = torch.zeros((), dtype=torch.float64, device=params_a[0].device)
-    for a, b in zip(params_a, params_b):
-        sq += (a.detach().float() - b.detach().float()).pow(2).sum().to(torch.float64)
+    """||a - b||_2. Works whether a and b are on the same device or not (streams per-tensor)."""
+    a0_dev = params_a[0].device
+    b0_dev = params_b[0].device
+    sq = torch.zeros((), dtype=torch.float64, device=a0_dev)
+    if a0_dev == b0_dev:
+        for a, b in zip(params_a, params_b):
+            sq += (a.detach().float() - b.detach().float()).pow(2).sum().to(torch.float64)
+    else:
+        # Stream b -> a's device one tensor at a time.
+        for a, b in zip(params_a, params_b):
+            b_on_a = b.detach().to(device=a0_dev, non_blocking=True)
+            sq += (a.detach().float() - b_on_a.float()).pow(2).sum().to(torch.float64)
+            del b_on_a
     return float(sq.sqrt().item())
 
 
 @torch.no_grad()
 def copy_into_snapshot(snapshot: list[torch.Tensor], model: torch.nn.Module):
-    """In-place copy current model params into the pre-allocated snapshot list."""
+    """In-place copy current model params into the pre-allocated snapshot list.
+    Handles both same-device and cross-device (D2H/H2D) copies."""
     for s, p in zip(snapshot, model.parameters()):
-        s.copy_(p.detach().to(dtype=s.dtype))
+        s.copy_(p.detach().to(dtype=s.dtype), non_blocking=True)
 
 
 # ----------------------------- checkpointing -----------------------------
@@ -582,6 +611,8 @@ def main():
     snapshot_dtype = {
         "float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16,
     }[args.snapshot_dtype]
+    snap_dev = torch.device(args.snapshot_device)
+    snap_pin = (snap_dev.type == "cpu")
 
     init_params = None
     prev_params = None
@@ -589,21 +620,21 @@ def main():
     init_params_path = os.path.join(args.output_dir, "init_params.pt")
     if is_main():
         if resume_ckpt_dir is not None:
-            log(f"  Loading init snapshot from {init_params_path}")
-            init_params = [
-                t.to(device=device, dtype=snapshot_dtype)
-                for t in torch.load(init_params_path, map_location="cpu")
-            ]
+            log(f"  Loading init snapshot from {init_params_path} -> {snap_dev}")
+            loaded = torch.load(init_params_path, map_location="cpu")
+            init_params = [t.to(device=snap_dev, dtype=snapshot_dtype) for t in loaded]
+            if snap_pin:
+                init_params = [t.pin_memory() for t in init_params]
             prev_path = os.path.join(resume_ckpt_dir, "prev_params.pt")
-            log(f"  Loading prev snapshot from {prev_path}")
-            prev_params = [
-                t.to(device=device, dtype=snapshot_dtype)
-                for t in torch.load(prev_path, map_location="cpu")
-            ]
+            log(f"  Loading prev snapshot from {prev_path} -> {snap_dev}")
+            loaded = torch.load(prev_path, map_location="cpu")
+            prev_params = [t.to(device=snap_dev, dtype=snapshot_dtype) for t in loaded]
+            if snap_pin:
+                prev_params = [t.pin_memory() for t in prev_params]
         else:
-            log(f"  Building parameter snapshots in {args.snapshot_dtype} (init + prev) ...")
-            init_params = snapshot_params(base_model, snapshot_dtype)
-            prev_params = snapshot_params(base_model, snapshot_dtype)
+            log(f"  Building parameter snapshots in {args.snapshot_dtype} on {snap_dev} (init + prev) ...")
+            init_params = snapshot_params(base_model, snapshot_dtype, device=snap_dev, pin_memory=snap_pin)
+            prev_params = snapshot_params(base_model, snapshot_dtype, device=snap_dev, pin_memory=snap_pin)
             torch.save([t.detach().cpu() for t in init_params], init_params_path)
         init_norm = param_l2_norm(init_params)
         log(f"  ||theta_0|| = {init_norm:.4e}")
@@ -726,21 +757,29 @@ def main():
                     "gradient_norm_post_clip": grad_norm_post,
                 }
                 if is_main():
-                    cur_norm = param_l2_norm([p.detach() for p in base_model.parameters()])
-                    diff_init = param_diff_l2_norm(
-                        [p.detach() for p in base_model.parameters()], init_params
+                    # Gate the expensive norm metrics on metrics_log_every. Also always compute
+                    # them on the very last step. The cheap loss/entropy/grad fields above are
+                    # already populated unconditionally.
+                    do_norms = (
+                        global_step % args.metrics_log_every == 0
+                        or global_step == total_steps
                     )
-                    diff_prev = param_diff_l2_norm(
-                        [p.detach() for p in base_model.parameters()], prev_params
-                    )
-                    metric_record.update({
-                        "parameter_l2_norm": cur_norm,
-                        "parameter_l2_from_init": diff_init,
-                        "relative_parameter_l2_from_init": diff_init / max(init_norm, 1e-12),
-                        "update_norm": diff_prev,
-                        "relative_update_norm": diff_prev / max(cur_norm, 1e-12),
-                    })
-                    copy_into_snapshot(prev_params, base_model)
+                    if do_norms:
+                        cur_norm = param_l2_norm([p.detach() for p in base_model.parameters()])
+                        diff_init = param_diff_l2_norm(
+                            [p.detach() for p in base_model.parameters()], init_params
+                        )
+                        diff_prev = param_diff_l2_norm(
+                            [p.detach() for p in base_model.parameters()], prev_params
+                        )
+                        metric_record.update({
+                            "parameter_l2_norm": cur_norm,
+                            "parameter_l2_from_init": diff_init,
+                            "relative_parameter_l2_from_init": diff_init / max(init_norm, 1e-12),
+                            "update_norm": diff_prev,
+                            "relative_update_norm": diff_prev / max(cur_norm, 1e-12),
+                        })
+                        copy_into_snapshot(prev_params, base_model)
 
                     metrics_fh.write(json.dumps(metric_record) + "\n")
                     metrics_fh.flush()
@@ -756,8 +795,8 @@ def main():
                             f"  step {global_step}/{total_steps} | "
                             f"loss: {batch_loss:.4f} | ent: {token_entropy:.3f} | "
                             f"gn_pre: {grad_norm_pre:.3f} | gn_post: {grad_norm_post:.3f} | "
-                            f"||θ-θ0||: {metric_record['parameter_l2_from_init']:.3e} | "
-                            f"||Δθ||: {metric_record['update_norm']:.3e} | "
+                            f"||θ-θ0||: {metric_record.get('parameter_l2_from_init', float('nan')):.3e} | "
+                            f"||Δθ||: {metric_record.get('update_norm', float('nan')):.3e} | "
                             f"lr: {scheduler.get_last_lr()[0]:.2e}"
                         )
 
