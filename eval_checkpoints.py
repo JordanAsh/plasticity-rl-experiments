@@ -83,10 +83,12 @@ def parse_args():
     # What to evaluate
     p.add_argument("--skip_probe", action="store_true")
     p.add_argument("--skip_old_data", action="store_true")
+    p.add_argument("--skip_new_data", action="store_true",
+                   help="Skip eval on samples first seen AFTER this checkpoint (the symmetric "
+                        "counterpart of old-data eval). Uses the same --old_data_step_stride.")
     p.add_argument("--old_data_step_stride", type=int, default=0,
-                   help="If > 0, only include old-data samples from training steps that are multiples "
-                        "of this stride (e.g. 50 or 100). Keeps later-checkpoint old-data eval bounded "
-                        "and gives every checkpoint a uniformly-spaced slice of its own history.")
+                   help="If > 0, only include old/new-data samples from training steps that are "
+                        "multiples of this stride (e.g. 50 or 100). Reused for both old and new data.")
     p.add_argument("--skip_kl", action="store_true",
                    help="Skip KL-from-init and KL-from-prev-ckpt.")
     p.add_argument("--skip_dead_units", action="store_true")
@@ -186,6 +188,33 @@ def cumulative_seen_per_checkpoint(entries: list[dict], ckpt_steps: list[int],
     # Any remaining (checkpoints beyond what we've seen) get the final running set.
     for cs in ckpt_steps_sorted[ci:]:
         out[cs] = set(running)
+    return out
+
+
+def future_seen_per_checkpoint(entries: list[dict], ckpt_steps: list[int],
+                               step_stride: int = 0) -> dict[int, set]:
+    """For each checkpoint step, return the set of sample_ids appearing in training
+    at any stride-eligible step strictly AFTER ckpt_step (i.e. samples the model has
+    not yet been trained on at this checkpoint, but will see later).
+    """
+    out: dict[int, set] = {s: set() for s in ckpt_steps}
+    ckpt_steps_sorted = sorted(ckpt_steps)
+    for e in entries:
+        step = e["global_step"]
+        if step_stride > 0 and step % step_stride != 0:
+            continue
+        sids: list = []
+        for mb in e["micro_batches"]:
+            sids.extend(mb["sample_ids"])
+        if not sids:
+            continue
+        # Add to every ckpt_step strictly less than this entry's step. ckpt_steps_sorted
+        # is ascending, so we can break as soon as ckpt_step >= step.
+        for cs in ckpt_steps_sorted:
+            if cs < step:
+                out[cs].update(sids)
+            else:
+                break
     return out
 
 
@@ -628,10 +657,12 @@ def main():
             pin_memory=True,
         )
 
-    # ---------- old-data dataset (full SFT dataset) ----------
+    # ---------- old/new-data dataset (full SFT dataset) ----------
+    need_sft = (not args.skip_old_data) or (not args.skip_new_data)
     full_sft_ds = None
     seen_per_ckpt: dict[int, set] = {}
-    if not args.skip_old_data:
+    future_seen_per_ckpt: dict[int, set] = {}
+    if need_sft:
         print(f"Reloading SFT positives from {gen_logs_dir} ...")
         positives = load_positives(
             gen_logs_dir, score_threshold=cfg.get("score_threshold", 0.0)
@@ -671,14 +702,22 @@ def main():
             print("  Empty slice for this rank; nothing to do.")
             return
 
-    if not args.skip_old_data:
+    if need_sft:
         entries = merge_manifests(args.run_dir)
-        seen_per_ckpt = cumulative_seen_per_checkpoint(
-            entries, [s for s, _ in ckpts], step_stride=args.old_data_step_stride,
-        )
-        if args.old_data_step_stride > 0:
-            sizes = {s: len(seen_per_ckpt.get(s, set())) for s, _ in ckpts}
-            print(f"  Old-data step stride = {args.old_data_step_stride}; per-ckpt sizes: {sizes}")
+        if not args.skip_old_data:
+            seen_per_ckpt = cumulative_seen_per_checkpoint(
+                entries, [s for s, _ in ckpts], step_stride=args.old_data_step_stride,
+            )
+            if args.old_data_step_stride > 0:
+                sizes = {s: len(seen_per_ckpt.get(s, set())) for s, _ in ckpts}
+                print(f"  Old-data step stride = {args.old_data_step_stride}; per-ckpt sizes: {sizes}")
+        if not args.skip_new_data:
+            future_seen_per_ckpt = future_seen_per_checkpoint(
+                entries, [s for s, _ in ckpts], step_stride=args.old_data_step_stride,
+            )
+            if args.old_data_step_stride > 0:
+                sizes = {s: len(future_seen_per_ckpt.get(s, set())) for s, _ in ckpts}
+                print(f"  New-data step stride = {args.old_data_step_stride}; per-ckpt sizes: {sizes}")
 
     # ---------- init model (kept loaded for KL-from-init) ----------
     init_model = None
@@ -789,6 +828,49 @@ def main():
                       )
             else:
                 result["old_data_size"] = 0
+
+        # ---- new data (samples first/only seen AFTER this checkpoint) ----
+        if full_sft_ds is not None and not args.skip_new_data:
+            future_seen = future_seen_per_ckpt.get(step, set())
+            new_indices = [i for i, it in enumerate(full_sft_ds.items) if it["sample_id"] in future_seen]
+            if args.old_data_step_stride > 0:
+                print(f"  new data size = {len(new_indices)} (stride={args.old_data_step_stride}, step > {step})")
+            else:
+                print(f"  new data size = {len(new_indices)} (step > {step})")
+            if new_indices:
+                new_subset = Subset(full_sft_ds, new_indices)
+                new_subset.items = [full_sft_ds.items[i] for i in new_indices]
+                new_subset.eos_ids = full_sft_ds.eos_ids
+                new_loader = DataLoader(
+                    new_subset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                )
+                new_metrics = evaluate_dataset(
+                    cur_model, init_model, prev_model, new_loader, device,
+                    do_dead_units=not args.skip_dead_units,
+                    epsilon=args.dead_unit_epsilon,
+                    dead_threshold=args.dead_unit_threshold,
+                    desc=f"new@{step}",
+                )
+                if args.grad_microbatches > 0:
+                    new_metrics["gradient"] = gradient_diagnostics(
+                        cur_model, new_subset, tokenizer.pad_token_id,
+                        args.grad_microbatches, args.grad_max_samples, device,
+                        desc=f"new-grad@{step}",
+                    )
+                result["new_data"] = new_metrics
+                result["new_data_size"] = len(new_indices)
+                result["new_data_step_stride"] = args.old_data_step_stride
+                print(f"  new:   loss={new_metrics['loss']:.4f} ent={new_metrics['token_entropy']:.3f}"
+                      + (f" kl_init={new_metrics.get('kl_from_init', float('nan')):.4e}" if "kl_from_init" in new_metrics else "")
+                      + (f" kl_prev={new_metrics.get('kl_from_previous_checkpoint', float('nan')):.4e}" if "kl_from_previous_checkpoint" in new_metrics else "")
+                      )
+            else:
+                result["new_data_size"] = 0
 
         # ---- save ----
         with open(out_path, "w") as f:
