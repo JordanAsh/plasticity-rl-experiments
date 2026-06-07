@@ -49,10 +49,54 @@ CKPT_SCALAR_FIELDS = [
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--run_dir", type=str, required=True)
+    p.add_argument("--run_dir", type=str, default=None,
+                   help="Single run dir (legacy single-run mode).")
+    p.add_argument("--run_dirs", type=str, default=None,
+                   help="Comma-separated list of run dirs to overlay on the same plots.")
+    p.add_argument("--labels", type=str, default=None,
+                   help="Comma-separated labels (one per run_dir). Defaults to basename of each run_dir.")
+    p.add_argument("--output_dir", type=str, default=None,
+                   help="Where to write comparison plots (compare mode). Defaults to "
+                        "<first_run_dir>/../plots_compare_<tag>.")
+    p.add_argument("--tag", type=str, default="compare",
+                   help="Suffix for the default output_dir in compare mode.")
     p.add_argument("--log_y", action="store_true",
                    help="Use log scale for grad norms / KL plots.")
+    p.add_argument("--train_skip_steps", type=int, default=0,
+                   help="Drop the first N training steps from training-curve plots so the y-axis "
+                        "isn't dominated by initial spikes (e.g. step-0 loss/entropy).")
+    p.add_argument("--y_quantile_clip", type=float, default=0.0,
+                   help="If > 0 and < 0.5, clip the y-axis of training plots to "
+                        "[q, 1-q] quantiles of the data so high-variance early steps don't \"blow up\" "
+                        "the visible range. Suggest 0.02 (2%%/98%%).")
     return p.parse_args()
+
+
+_PRETTY = {
+    "kl_from_init": "KL(p_init || p_curr)",
+    "kl_from_previous_checkpoint": "KL(p_prev || p_curr)",
+}
+
+
+def _pretty(key: str) -> str:
+    return _PRETTY.get(key, key)
+
+
+def _apply_y_clip(ax, vals_iter, q: float):
+    """Clip y-axis to [q, 1-q] quantiles of the supplied values, with 5%% padding."""
+    import numpy as np
+    if q <= 0 or q >= 0.5:
+        return
+    arr = np.asarray([v for v in vals_iter if v is not None], dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return
+    lo = float(np.quantile(arr, q))
+    hi = float(np.quantile(arr, 1.0 - q))
+    if not (hi > lo):
+        return
+    pad = 0.05 * (hi - lo)
+    ax.set_ylim(lo - pad, hi + pad)
 
 
 def read_jsonl(path):
@@ -65,7 +109,8 @@ def read_jsonl(path):
     return out
 
 
-def plot_train(run_dir: str, log_y: bool):
+def plot_train(run_dir: str, log_y: bool, train_skip_steps: int = 0,
+               y_quantile_clip: float = 0.0):
     metrics_path = os.path.join(run_dir, "metrics", "train_metrics.jsonl")
     if not os.path.exists(metrics_path):
         print(f"No {metrics_path}; skipping training plots.")
@@ -73,6 +118,8 @@ def plot_train(run_dir: str, log_y: bool):
     rows = read_jsonl(metrics_path)
     if not rows:
         return
+    if train_skip_steps > 0:
+        rows = [r for r in rows if r.get("global_step", 0) >= train_skip_steps]
     out_dir = os.path.join(run_dir, "plots", "train")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -86,11 +133,13 @@ def plot_train(run_dir: str, log_y: bool):
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.plot(xs, vals, lw=1.0)
         ax.set_xlabel("global_step")
-        ax.set_ylabel(key)
-        ax.set_title(key)
+        ax.set_ylabel(_pretty(key))
+        ax.set_title(_pretty(key))
         ax.grid(True, alpha=0.3)
         if log_y and ("grad" in key or "kl" in key or "update_norm" == key):
             ax.set_yscale("log")
+        else:
+            _apply_y_clip(ax, vals, y_quantile_clip)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, f"{key}.png"), dpi=120)
         plt.close(fig)
@@ -116,7 +165,7 @@ def plot_checkpoints(run_dir: str, log_y: bool):
     for key in CKPT_SCALAR_FIELDS:
         fig, ax = plt.subplots(figsize=(7, 4))
         plotted = False
-        for split in ("probe", "old_data"):
+        for split in ("probe", "old_data", "new_data"):
             xs, ys = [], []
             for s, r in zip(steps, rows):
                 v = r.get(split, {}).get(key)
@@ -130,8 +179,8 @@ def plot_checkpoints(run_dir: str, log_y: bool):
             plt.close(fig)
             continue
         ax.set_xlabel("global_step")
-        ax.set_ylabel(key)
-        ax.set_title(key)
+        ax.set_ylabel(_pretty(key))
+        ax.set_title(_pretty(key))
         ax.grid(True, alpha=0.3)
         ax.legend()
         if log_y and "kl" in key:
@@ -144,7 +193,7 @@ def plot_checkpoints(run_dir: str, log_y: bool):
     for grad_key in ("mean_gradient_norm", "gradient_variance_per_param", "gradient_noise_scale"):
         fig, ax = plt.subplots(figsize=(7, 4))
         plotted = False
-        for split in ("probe", "old_data"):
+        for split in ("probe", "old_data", "new_data"):
             xs, ys = [], []
             for s, r in zip(steps, rows):
                 v = r.get(split, {}).get("gradient", {}).get(grad_key)
@@ -171,7 +220,7 @@ def plot_checkpoints(run_dir: str, log_y: bool):
     # ---------- dead units overall (per split) ----------
     fig, ax = plt.subplots(figsize=(7, 4))
     plotted = False
-    for split in ("probe", "old_data"):
+    for split in ("probe", "old_data", "new_data"):
         xs, ys = [], []
         for s, r in zip(steps, rows):
             du = r.get(split, {}).get("dead_units", {}).get("_overall")
@@ -193,7 +242,7 @@ def plot_checkpoints(run_dir: str, log_y: bool):
 
     # ---------- per-layer dead units, one figure per checkpoint ----------
     for s, r in zip(steps, rows):
-        for split in ("probe", "old_data"):
+        for split in ("probe", "old_data", "new_data"):
             du = r.get(split, {}).get("dead_units")
             if not du:
                 continue
@@ -228,9 +277,188 @@ def plot_checkpoints(run_dir: str, log_y: bool):
     print(f"Wrote checkpoint plots to {out_dir}")
 
 
+# ---------------------------- compare mode --------------------------------
+
+def _load_train_rows(run_dir: str):
+    path = os.path.join(run_dir, "metrics", "train_metrics.jsonl")
+    return read_jsonl(path) if os.path.exists(path) else []
+
+
+def _load_ckpt_rows(run_dir: str):
+    files = sorted(
+        glob(os.path.join(run_dir, "checkpoints", "step_*", "eval_metrics.json")),
+        key=lambda p: int(os.path.basename(os.path.dirname(p)).split("_")[1]),
+    )
+    return [json.load(open(p)) for p in files]
+
+
+def plot_compare(run_dirs: list[str], labels: list[str], out_dir: str, log_y: bool,
+                 train_skip_steps: int = 0, y_quantile_clip: float = 0.0):
+    os.makedirs(out_dir, exist_ok=True)
+    train_dir = os.path.join(out_dir, "train")
+    ckpt_dir = os.path.join(out_dir, "checkpoints")
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    cmap = plt.get_cmap("tab10")
+    colors = [cmap(i % 10) for i in range(len(run_dirs))]
+
+    # ---------- training curves ----------
+    train_rows_per_run = [_load_train_rows(r) for r in run_dirs]
+    if train_skip_steps > 0:
+        train_rows_per_run = [
+            [r for r in rows if r.get("global_step", 0) >= train_skip_steps]
+            for rows in train_rows_per_run
+        ]
+    for key in TRAIN_METRICS:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        plotted = False
+        all_vals = []
+        for rows, lbl, c in zip(train_rows_per_run, labels, colors):
+            if not rows:
+                continue
+            xs, ys = [], []
+            for r in rows:
+                v = r.get(key)
+                if v is not None:
+                    xs.append(r["global_step"])
+                    ys.append(v)
+            if xs:
+                ax.plot(xs, ys, lw=1.0, label=lbl, color=c)
+                all_vals.extend(ys)
+                plotted = True
+        if not plotted:
+            plt.close(fig)
+            continue
+        ax.set_xlabel("global_step")
+        ax.set_ylabel(_pretty(key))
+        ax.set_title(_pretty(key))
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        if log_y and ("grad" in key or "kl" in key or key == "update_norm"):
+            ax.set_yscale("log")
+        else:
+            _apply_y_clip(ax, all_vals, y_quantile_clip)
+        fig.tight_layout()
+        fig.savefig(os.path.join(train_dir, f"{key}.png"), dpi=120)
+        plt.close(fig)
+
+    # ---------- checkpoint scalars ----------
+    ckpt_rows_per_run = [_load_ckpt_rows(r) for r in run_dirs]
+    splits = ("probe", "old_data", "new_data")
+    linestyles = {"probe": "--", "old_data": "-", "new_data": ":"}
+
+    for key in CKPT_SCALAR_FIELDS:
+        fig, ax = plt.subplots(figsize=(7, 4))
+        plotted = False
+        for rows, lbl, c in zip(ckpt_rows_per_run, labels, colors):
+            for split in splits:
+                xs, ys = [], []
+                for r in rows:
+                    v = r.get(split, {}).get(key)
+                    if v is not None:
+                        xs.append(r["global_step"])
+                        ys.append(v)
+                if xs:
+                    ax.plot(xs, ys, marker="o", linestyle=linestyles[split],
+                            color=c, label=f"{lbl}/{split}")
+                    plotted = True
+        if not plotted:
+            plt.close(fig)
+            continue
+        ax.set_xlabel("global_step")
+        ax.set_ylabel(_pretty(key))
+        ax.set_title(_pretty(key))
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+        if log_y and "kl" in key:
+            ax.set_yscale("log")
+        fig.tight_layout()
+        fig.savefig(os.path.join(ckpt_dir, f"{key}.png"), dpi=120)
+        plt.close(fig)
+
+    # ---------- gradient diagnostics ----------
+    for grad_key in ("mean_gradient_norm", "gradient_variance_per_param", "gradient_noise_scale"):
+        fig, ax = plt.subplots(figsize=(7, 4))
+        plotted = False
+        for rows, lbl, c in zip(ckpt_rows_per_run, labels, colors):
+            for split in splits:
+                xs, ys = [], []
+                for r in rows:
+                    v = r.get(split, {}).get("gradient", {}).get(grad_key)
+                    if v is not None:
+                        xs.append(r["global_step"])
+                        ys.append(v)
+                if xs:
+                    ax.plot(xs, ys, marker="o", linestyle=linestyles[split],
+                            color=c, label=f"{lbl}/{split}")
+                    plotted = True
+        if not plotted:
+            plt.close(fig)
+            continue
+        ax.set_xlabel("global_step")
+        ax.set_ylabel(grad_key)
+        ax.set_title(grad_key)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+        if log_y:
+            ax.set_yscale("log")
+        fig.tight_layout()
+        fig.savefig(os.path.join(ckpt_dir, f"{grad_key}.png"), dpi=120)
+        plt.close(fig)
+
+    # ---------- dead units overall ----------
+    fig, ax = plt.subplots(figsize=(7, 4))
+    plotted = False
+    for rows, lbl, c in zip(ckpt_rows_per_run, labels, colors):
+        for split in splits:
+            xs, ys = [], []
+            for r in rows:
+                du = r.get(split, {}).get("dead_units", {}).get("_overall")
+                if du is not None:
+                    xs.append(r["global_step"])
+                    ys.append(du["dead_fraction"])
+            if xs:
+                ax.plot(xs, ys, marker="o", linestyle=linestyles[split],
+                        color=c, label=f"{lbl}/{split}")
+                plotted = True
+    if plotted:
+        ax.set_xlabel("global_step")
+        ax.set_ylabel("dead unit fraction (overall)")
+        ax.set_title("Dead units (overall, across all MLP layers)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(ckpt_dir, "dead_units_overall.png"), dpi=120)
+    plt.close(fig)
+
+    print(f"Wrote comparison plots to {out_dir}")
+    print(f"  runs: {list(zip(labels, run_dirs))}")
+
+
 def main():
     args = parse_args()
-    plot_train(args.run_dir, args.log_y)
+    if args.run_dirs:
+        run_dirs = [r.strip() for r in args.run_dirs.split(",") if r.strip()]
+        if args.labels:
+            labels = [s.strip() for s in args.labels.split(",")]
+            assert len(labels) == len(run_dirs), "--labels count must match --run_dirs"
+        else:
+            labels = [os.path.basename(os.path.normpath(r)) for r in run_dirs]
+        if args.output_dir:
+            out_dir = args.output_dir
+        else:
+            parent = os.path.dirname(os.path.normpath(run_dirs[0]))
+            out_dir = os.path.join(parent, f"plots_{args.tag}")
+        plot_compare(run_dirs, labels, out_dir, args.log_y,
+                     train_skip_steps=args.train_skip_steps,
+                     y_quantile_clip=args.y_quantile_clip)
+        return
+    if not args.run_dir:
+        raise SystemExit("Provide either --run_dir or --run_dirs")
+    plot_train(args.run_dir, args.log_y,
+               train_skip_steps=args.train_skip_steps,
+               y_quantile_clip=args.y_quantile_clip)
     plot_checkpoints(args.run_dir, args.log_y)
 
 
