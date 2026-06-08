@@ -111,6 +111,10 @@ def parse_args():
                     help="Train on positives in step order (default: shuffled)")
     p.add_argument("--score_threshold", type=float, default=0.0,
                     help="Only keep generations with score strictly greater than this (default 0.0)")
+    p.add_argument("--drop_all_pass_groups", action="store_true",
+                    help="Drop all positives from (step, prompt) groups where every rollout in the "
+                         "group passed --score_threshold. Used to break batch homogeneity caused by "
+                         "many redundant near-identical templated rollouts of the same prompt.")
     p.add_argument("--num_epochs", type=int, default=1)
     # instrumentation
     p.add_argument("--num_checkpoints", type=int, default=10,
@@ -134,7 +138,19 @@ def parse_args():
     return p.parse_args()
 
 
-def load_positives(logs_dir: str, score_threshold: float = 0.0) -> list[dict]:
+def load_positives(logs_dir: str, score_threshold: float = 0.0,
+                   drop_all_pass_groups: bool = False) -> list[dict]:
+    """Load (prompt, response) positives from per-RL-step .jsonl files.
+
+    Args:
+        logs_dir: directory of {step}.jsonl files. Each line has
+            {"input": str, "output": str, "score": float, "step": int, "uid": ...}.
+        score_threshold: keep only records with score > threshold.
+        drop_all_pass_groups: if True, drop all positives from (step, prompt) groups in
+            which every rollout passes the score threshold. Such groups are typically
+            collapsed-policy rollouts that are nearly identical to each other and cause
+            severe batch homogeneity (many duplicated templates per minibatch).
+    """
     positives = []
     files = sorted(
         [f for f in os.listdir(logs_dir) if f.endswith(".jsonl")],
@@ -144,14 +160,42 @@ def load_positives(logs_dir: str, score_threshold: float = 0.0) -> list[dict]:
         raise FileNotFoundError(f"No .jsonl files found in {logs_dir}")
 
     skipped = 0
+    # If filtering, do a first pass over each file to compute (step, prompt) group sizes
+    # and pass-counts. We deliberately key on raw `input` to avoid any tokenization
+    # subtleties; it groups exactly the rollouts produced for the same prompt at the
+    # same RL step.
+    dropped_groups_total = 0
+    dropped_positives_total = 0
     for fname in files:
         step = int(fname.split(".")[0])
-        with open(os.path.join(logs_dir, fname)) as fh:
+        path = os.path.join(logs_dir, fname)
+
+        all_pass_inputs: set | None = None
+        if drop_all_pass_groups:
+            group_total: dict[str, int] = {}
+            group_pass: dict[str, int] = {}
+            with open(path) as fh:
+                for line in fh:
+                    record = json.loads(line)
+                    inp = record["input"]
+                    group_total[inp] = group_total.get(inp, 0) + 1
+                    if record["score"] > score_threshold:
+                        group_pass[inp] = group_pass.get(inp, 0) + 1
+            all_pass_inputs = {
+                inp for inp, n in group_total.items()
+                if group_pass.get(inp, 0) == n
+            }
+            dropped_groups_total += len(all_pass_inputs)
+            dropped_positives_total += sum(group_total[inp] for inp in all_pass_inputs)
+
+        with open(path) as fh:
             for line_idx, line in enumerate(fh):
                 record = json.loads(line)
                 if record["score"] <= score_threshold:
                     continue
                 inp = record["input"]
+                if all_pass_inputs is not None and inp in all_pass_inputs:
+                    continue
                 # Slice out the last user turn regardless of what system prompt was used
                 if not inp.endswith(ASSIST_MARK):
                     skipped += 1
@@ -170,6 +214,9 @@ def load_positives(logs_dir: str, score_threshold: float = 0.0) -> list[dict]:
 
     if skipped > 0:
         print(f"WARNING: Skipped {skipped} records with unexpected template format")
+    if drop_all_pass_groups:
+        print(f"  drop_all_pass_groups: removed {dropped_groups_total} (step, prompt) groups "
+              f"({dropped_positives_total} positives) where every rollout passed the threshold")
     return positives
 
 
@@ -492,7 +539,11 @@ def main():
 
     # ---------- load data ----------
     log(f"Loading positives from {args.generation_logs_dir} ...")
-    positives = load_positives(args.generation_logs_dir, score_threshold=args.score_threshold)
+    positives = load_positives(
+        args.generation_logs_dir,
+        score_threshold=args.score_threshold,
+        drop_all_pass_groups=args.drop_all_pass_groups,
+    )
     log(f"  Total positives: {len(positives):,}")
 
     if not args.ordered:
