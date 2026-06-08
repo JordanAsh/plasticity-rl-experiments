@@ -7,8 +7,8 @@ REPO_ROOT="$(pwd)"
 # Existing 1.5B runs (already trained). Use absolute paths so HF/vLLM does not
 # mistake them for hub repo ids.
 MODELS=(
-    "${REPO_ROOT}/sft_outputs/kk_1.5b_shuffled_lr1e5|kk_1.5b_sft_shuffled_lr1e5"
-    "${REPO_ROOT}/sft_outputs/kk_1.5b_ordered_lr1e5|kk_1.5b_sft_ordered_lr1e5"
+    "${REPO_ROOT}/sft_outputs/kk_1.5b_shuffled_lr1e5_dropAllPass|kk_1.5b_sft_shuffled_lr1e5_dropAllPass"
+    "${REPO_ROOT}/sft_outputs/kk_1.5b_ordered_lr1e5_dropAllPass|kk_1.5b_sft_ordered_lr1e5_dropAllPass"
 )
 
 echo "========== Eval start at $(date) =========="
