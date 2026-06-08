@@ -24,6 +24,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Shared plot style (serif, larger fonts) — matches the Section 4.2 benchmark plots.
+PLOT_STYLE = {
+    "font.family":      "serif",
+    "font.serif":       ["DejaVu Serif", "Liberation Serif", "Times", "serif"],
+    "font.size":        18, "axes.titlesize":  20, "axes.labelsize":  18,
+    "xtick.labelsize":  14, "ytick.labelsize":  14, "legend.fontsize": 14,
+    "axes.linewidth":   1.4, "grid.linewidth":   0.9, "lines.linewidth": 2.0,
+}
+plt.rcParams.update(PLOT_STYLE)
+
 
 TRAIN_METRICS = [
     "batch_loss",
@@ -292,6 +302,125 @@ def _load_ckpt_rows(run_dir: str):
     return [json.load(open(p)) for p in files]
 
 
+def _grid(n: int, ncols: int = 3):
+    """Make a (nrows x ncols) subplot grid sized for n panels; return (fig, flat_axes)."""
+    ncols = min(ncols, max(1, n))
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.2 * ncols, 4.4 * nrows),
+                             squeeze=False)
+    return fig, list(axes.flatten())
+
+
+def _shared_legend(fig, axes, n_used):
+    """Attach one figure-level legend, taken from whichever panel has the most series."""
+    handles, labs = [], []
+    for ax in axes[:n_used]:
+        h, l = ax.get_legend_handles_labels()
+        if len(l) > len(labs):
+            handles, labs = h, l
+    if handles:
+        fig.legend(handles, labs, loc="lower center",
+                   ncol=min(len(labs), 4))
+
+
+def plot_summary_train(train_rows_per_run, labels, colors, out_path: str,
+                       log_y: bool, y_quantile_clip: float = 0.0):
+    """All training metrics as subplots in a single figure (runs overlaid)."""
+    keys = [k for k in TRAIN_METRICS
+            if any(any(r.get(k) is not None for r in rows) for rows in train_rows_per_run)]
+    if not keys:
+        return
+    fig, axes = _grid(len(keys))
+    for idx, key in enumerate(keys):
+        ax = axes[idx]
+        all_vals = []
+        for rows, lbl, c in zip(train_rows_per_run, labels, colors):
+            if not rows:
+                continue
+            xs, ys = [], []
+            for r in rows:
+                v = r.get(key)
+                if v is not None:
+                    xs.append(r["global_step"])
+                    ys.append(v)
+            if xs:
+                ax.plot(xs, ys, lw=1.0, label=lbl, color=c)
+                all_vals.extend(ys)
+        ax.set_title(_pretty(key), fontweight="bold")
+        ax.set_xlabel("global_step")
+        ax.grid(True, alpha=0.3)
+        if log_y and ("grad" in key or "kl" in key or key == "update_norm"):
+            ax.set_yscale("log")
+        else:
+            _apply_y_clip(ax, all_vals, y_quantile_clip)
+    for ax in axes[len(keys):]:
+        ax.axis("off")
+    _shared_legend(fig, axes, len(keys))
+    fig.suptitle("Training metrics", fontsize=24, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.05, 1, 0.96])
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Wrote training summary to {out_path}")
+
+
+def plot_summary_checkpoints(ckpt_rows_per_run, labels, colors, out_path: str,
+                             log_y: bool):
+    """All checkpoint metrics as subplots, overlaying run x (old_data/new_data/probe)."""
+    splits = ("probe", "old_data", "new_data")
+    linestyles = {"probe": "--", "old_data": "-", "new_data": ":"}
+
+    # (title, getter(row, split) -> value or None, prefers_log_scale)
+    panels = []
+    for key in CKPT_SCALAR_FIELDS:
+        panels.append((_pretty(key),
+                       (lambda r, s, key=key: r.get(s, {}).get(key)),
+                       ("kl" in key)))
+    for gk in ("mean_gradient_norm", "gradient_variance_per_param", "gradient_noise_scale"):
+        panels.append((gk,
+                       (lambda r, s, gk=gk: r.get(s, {}).get("gradient", {}).get(gk)),
+                       True))
+
+    def _dead(r, s):
+        du = r.get(s, {}).get("dead_units", {}).get("_overall")
+        return du["dead_fraction"] if du else None
+    panels.append(("dead unit fraction (overall)", _dead, False))
+
+    def _has_data(getter):
+        return any(getter(r, s) is not None
+                   for rows in ckpt_rows_per_run for r in rows for s in splits)
+    panels = [p for p in panels if _has_data(p[1])]
+    if not panels:
+        return
+
+    fig, axes = _grid(len(panels))
+    for idx, (title, getter, prefers_log) in enumerate(panels):
+        ax = axes[idx]
+        for rows, lbl, c in zip(ckpt_rows_per_run, labels, colors):
+            for s in splits:
+                xs, ys = [], []
+                for r in rows:
+                    v = getter(r, s)
+                    if v is not None:
+                        xs.append(r["global_step"])
+                        ys.append(v)
+                if xs:
+                    ax.plot(xs, ys, marker="o", ms=3, linestyle=linestyles[s],
+                            color=c, label=f"{lbl}/{s}")
+        ax.set_title(title, fontweight="bold")
+        ax.set_xlabel("global_step")
+        ax.grid(True, alpha=0.3)
+        if log_y and prefers_log:
+            ax.set_yscale("log")
+    for ax in axes[len(panels):]:
+        ax.axis("off")
+    _shared_legend(fig, axes, len(panels))
+    fig.suptitle("Comparison on old vs new data", fontsize=24, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.07, 1, 0.96])
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Wrote checkpoint comparison summary to {out_path}")
+
+
 def plot_compare(run_dirs: list[str], labels: list[str], out_dir: str, log_y: bool,
                  train_skip_steps: int = 0, y_quantile_clip: float = 0.0):
     os.makedirs(out_dir, exist_ok=True)
@@ -370,7 +499,7 @@ def plot_compare(run_dirs: list[str], labels: list[str], out_dir: str, log_y: bo
         ax.set_ylabel(_pretty(key))
         ax.set_title(_pretty(key))
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=12)
         if log_y and "kl" in key:
             ax.set_yscale("log")
         fig.tight_layout()
@@ -400,7 +529,7 @@ def plot_compare(run_dirs: list[str], labels: list[str], out_dir: str, log_y: bo
         ax.set_ylabel(grad_key)
         ax.set_title(grad_key)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=12)
         if log_y:
             ax.set_yscale("log")
         fig.tight_layout()
@@ -427,10 +556,18 @@ def plot_compare(run_dirs: list[str], labels: list[str], out_dir: str, log_y: bo
         ax.set_ylabel("dead unit fraction (overall)")
         ax.set_title("Dead units (overall, across all MLP layers)")
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=12)
         fig.tight_layout()
         fig.savefig(os.path.join(ckpt_dir, "dead_units_overall.png"), dpi=120)
     plt.close(fig)
+
+    # ---------- single-figure summaries ----------
+    plot_summary_train(train_rows_per_run, labels, colors,
+                       os.path.join(out_dir, "summary_training_metrics.png"),
+                       log_y, y_quantile_clip=y_quantile_clip)
+    plot_summary_checkpoints(ckpt_rows_per_run, labels, colors,
+                             os.path.join(out_dir, "comparison_old_new_data.png"),
+                             log_y)
 
     print(f"Wrote comparison plots to {out_dir}")
     print(f"  runs: {list(zip(labels, run_dirs))}")
@@ -460,6 +597,22 @@ def main():
                train_skip_steps=args.train_skip_steps,
                y_quantile_clip=args.y_quantile_clip)
     plot_checkpoints(args.run_dir, args.log_y)
+
+    # single-figure summaries (single-run = one overlaid "run")
+    label = os.path.basename(os.path.normpath(args.run_dir))
+    color = [plt.get_cmap("tab10")(0)]
+    plots_dir = os.path.join(args.run_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    train_rows = _load_train_rows(args.run_dir)
+    if args.train_skip_steps > 0:
+        train_rows = [r for r in train_rows
+                      if r.get("global_step", 0) >= args.train_skip_steps]
+    plot_summary_train([train_rows], [label], color,
+                       os.path.join(plots_dir, "summary_training_metrics.png"),
+                       args.log_y, y_quantile_clip=args.y_quantile_clip)
+    plot_summary_checkpoints([_load_ckpt_rows(args.run_dir)], [label], color,
+                             os.path.join(plots_dir, "comparison_old_new_data.png"),
+                             args.log_y)
 
 
 if __name__ == "__main__":
