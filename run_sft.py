@@ -115,6 +115,8 @@ def parse_args():
                     help="Drop all positives from (step, prompt) groups where every rollout in the "
                          "group passed --score_threshold. Used to break batch homogeneity caused by "
                          "many redundant near-identical templated rollouts of the same prompt.")
+    p.add_argument("--max_rl_step", type=int, default=None,
+                    help="If set, only load positives from {step}.jsonl files with step <= this value.")
     p.add_argument("--num_epochs", type=int, default=1)
     # instrumentation
     p.add_argument("--num_checkpoints", type=int, default=10,
@@ -139,7 +141,8 @@ def parse_args():
 
 
 def load_positives(logs_dir: str, score_threshold: float = 0.0,
-                   drop_all_pass_groups: bool = False) -> list[dict]:
+                   drop_all_pass_groups: bool = False,
+                   max_rl_step: int | None = None) -> list[dict]:
     """Load (prompt, response) positives from per-RL-step .jsonl files.
 
     Args:
@@ -158,6 +161,12 @@ def load_positives(logs_dir: str, score_threshold: float = 0.0,
     )
     if not files:
         raise FileNotFoundError(f"No .jsonl files found in {logs_dir}")
+    if max_rl_step is not None:
+        files = [f for f in files if int(f.split(".")[0]) <= max_rl_step]
+        if not files:
+            raise FileNotFoundError(
+                f"No .jsonl files in {logs_dir} have step <= max_rl_step={max_rl_step}"
+            )
 
     skipped = 0
     # If filtering, do a first pass over each file to compute (step, prompt) group sizes
@@ -543,6 +552,7 @@ def main():
         args.generation_logs_dir,
         score_threshold=args.score_threshold,
         drop_all_pass_groups=args.drop_all_pass_groups,
+        max_rl_step=args.max_rl_step,
     )
     log(f"  Total positives: {len(positives):,}")
 
