@@ -8,26 +8,28 @@ Differences from `eval_checkpoints.py`:
 - Inputs are HuggingFace-format RL checkpoints in a directory named
   `.../checkpoints_hf_format/global_step_{N}/` (as produced by the FSDP→HF
   conversion in this repo).
-- The "training data seen by this checkpoint" is recovered from the per-step
-  rollout dumps at `.../rollouts/training/{N}.jsonl` (the batch generated at
-  step N, which was scored and then used to update the model into
-  global_step_{N+1}). For checkpoint `global_step_{N}` we use the rollouts
-  collected by that very checkpoint (file `{N}.jsonl`) — i.e. "the previous
-  batch" relative to the next gradient step.
-- Each rollout record has a scalar `score`. We split the batch into:
-      positive samples = {score == 1.0}
-      negative samples = {score == 0.0}
+- The "training data" history is recovered from the per-step rollout dumps at
+  `.../rollouts/training/{k}.jsonl` (the batch generated at step k, scored,
+  then used to update the policy).
+- Each checkpoint is evaluated on three scopes:
+      in_batch:  rollouts at this very step (file `{N}.jsonl`)
+      old_data:  rollouts from earlier stride-eligible steps (k < N)
+      new_data:  rollouts from later stride-eligible steps  (k > N)
+  Within each scope, samples are split by score into:
+      positive = {score == 1.0}
+      negative = {score == 0.0}
   Every metric (loss, token entropy, KL-from-init, KL-from-previous-checkpoint,
-  dead-units) is reported separately for the positive and negative subsets.
+  dead-units) is reported separately for each (scope, polarity) subset.
 
 Per-checkpoint results are saved to
     {checkpoint_dir}/global_step_{N}/eval_metrics.json
 with the structure
     {
-        "global_step": N,
-        ...
-        "positive": {...metrics + "size": int },
-        "negative": {...metrics + "size": int },
+      "global_step": N,
+      ...
+      "in_batch":  { "positive": {...}, "negative": {...}, ... },
+      "old_data":  { "positive": {...}, "negative": {...}, ... },
+      "new_data":  { "positive": {...}, "negative": {...}, ... },
     }
 
 Single-GPU. KL is computed on-the-fly by running init / prev / cur models on
@@ -40,7 +42,8 @@ Usage:
         --init_model_path Qwen/Qwen2.5-3B \
         --step_interval 50
 
-Disable expensive parts via --skip_kl, --skip_dead_units.
+Disable expensive parts via --skip_kl, --skip_dead_units, --skip_in_batch,
+--skip_old_data, --skip_new_data.
 """
 
 import argparse
@@ -83,16 +86,25 @@ def parse_args():
                    help="Only evaluate global_step_{N} where N is a multiple of this.")
     p.add_argument("--checkpoints", type=str, default=None,
                    help="Comma-separated explicit list of step numbers; overrides --step_interval.")
+    p.add_argument("--history_step_stride", type=int, default=0,
+                   help="Stride for old/new-data aggregation: include rollouts {k}.jsonl only "
+                        "where k is a multiple of this. Defaults to --step_interval.")
     p.add_argument("--skip_kl", action="store_true",
                    help="Skip KL-from-init and KL-from-prev-ckpt.")
     p.add_argument("--skip_dead_units", action="store_true")
+    p.add_argument("--skip_in_batch", action="store_true",
+                   help="Skip eval on rollouts collected at this very checkpoint step.")
+    p.add_argument("--skip_old_data", action="store_true",
+                   help="Skip eval on rollouts from earlier stride-eligible steps (k < N).")
+    p.add_argument("--skip_new_data", action="store_true",
+                   help="Skip eval on rollouts from later stride-eligible steps (k > N).")
     p.add_argument("--positive_score", type=float, default=1.0,
                    help="Records with score == this value form the 'positive' subset.")
     p.add_argument("--negative_score", type=float, default=0.0,
                    help="Records with score == this value form the 'negative' subset.")
-    p.add_argument("--max_samples_per_class", type=int, default=0,
+    p.add_argument("--max_samples_per_class", type=int, default=256,
                    help="If >0, cap each of positive/negative subsets to this many samples "
-                        "(deterministic prefix order).")
+                        "(deterministic prefix order). Applied per scope (in_batch / old_data / new_data).")
     p.add_argument("--append_eos", action=argparse.BooleanOptionalAction, default=True,
                    help="Append tokenizer.eos_token_id to each response.")
 
@@ -110,7 +122,7 @@ def parse_args():
     p.add_argument("--overwrite", action="store_true")
     # multi-GPU parallel eval (same slicing contract as eval_checkpoints.py)
     p.add_argument("--rank", type=int, default=0)
-    p.add_argument("--world_size", type=int, default=1)
+    p.add_argument("--world_size", type=int, default=4)
     return p.parse_args()
 
 
@@ -158,7 +170,38 @@ def load_rollouts(rollouts_dir: str, step: int) -> list[dict]:
                 continue
             rec = json.loads(line)
             rec["_line_idx"] = i
+            rec["_step"] = step
             out.append(rec)
+    return out
+
+
+def list_rollout_steps(rollouts_dir: str) -> list[int]:
+    """Return all integer steps for which `{step}.jsonl` exists, sorted ascending."""
+    out = []
+    for fname in os.listdir(rollouts_dir):
+        m = re.match(r"(\d+)\.jsonl$", fname)
+        if m:
+            out.append(int(m.group(1)))
+    out.sort()
+    return out
+
+
+def load_rollouts_aggregated(rollouts_dir: str, steps: list[int]) -> list[dict]:
+    """Concatenate rollouts from a list of step files, skipping any that are missing."""
+    out = []
+    for k in steps:
+        path = os.path.join(rollouts_dir, f"{k}.jsonl")
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                rec["_line_idx"] = i
+                rec["_step"] = k
+                out.append(rec)
     return out
 
 
@@ -172,7 +215,7 @@ class RolloutDataset(Dataset):
     """
 
     def __init__(self, records: list[dict], tokenizer, max_seq_length: int,
-                 append_eos: bool, step: int, tag: str):
+                 append_eos: bool, tag: str):
         self.max_seq_length = max_seq_length
         # `eos_ids` is also consumed by gradient_diagnostics in eval_checkpoints.py;
         # keeping the attribute name matches SFTDataset.
@@ -203,7 +246,7 @@ class RolloutDataset(Dataset):
             self.items.append({
                 "prompt_ids": p_ids,
                 "response_ids": r_ids,
-                "sample_id": f"{tag}@step{step}:{rec.get('_line_idx', i)}",
+                "sample_id": f"{tag}@step{rec.get('_step', 0)}:{rec.get('_line_idx', i)}",
             })
 
     def __len__(self):
@@ -263,6 +306,20 @@ def main():
         )
     print(f"Will evaluate {len(ckpts)} checkpoints: {[s for s, _ in ckpts]}")
 
+    # ---------- history aggregation steps ----------
+    history_stride = args.history_step_stride if args.history_step_stride > 0 else args.step_interval
+    need_history = (not args.skip_old_data) or (not args.skip_new_data)
+    available_rollout_steps: list[int] = []
+    history_steps: list[int] = []
+    if need_history:
+        available_rollout_steps = list_rollout_steps(rollouts_dir)
+        if history_stride > 0:
+            history_steps = [k for k in available_rollout_steps if k % history_stride == 0]
+        else:
+            history_steps = list(available_rollout_steps)
+        print(f"  history step stride = {history_stride}; "
+              f"{len(history_steps)} eligible rollout files for old/new aggregation")
+
     # ---------- multi-GPU parallel slicing ----------
     predecessor_ckpt = None
     if args.world_size > 1:
@@ -307,18 +364,26 @@ def main():
 
         print(f"\n=== Checkpoint step {step}: {ckpt_dir} ===")
 
-        # ---- load rollouts for this step ----
-        try:
-            records = load_rollouts(rollouts_dir, step)
-        except FileNotFoundError as e:
-            print(f"  WARNING: {e}; skipping this checkpoint")
+        # ---- gather records per scope ----
+        scopes: list[tuple[str, list[dict], list[int]]] = []  # (name, records, source_steps)
+        if not args.skip_in_batch:
+            try:
+                in_batch_records = load_rollouts(rollouts_dir, step)
+                scopes.append(("in_batch", in_batch_records, [step]))
+            except FileNotFoundError as e:
+                print(f"  WARNING: in_batch: {e}")
+        if not args.skip_old_data:
+            old_steps = [k for k in history_steps if k < step]
+            old_records = load_rollouts_aggregated(rollouts_dir, old_steps)
+            scopes.append(("old_data", old_records, old_steps))
+        if not args.skip_new_data:
+            new_steps = [k for k in history_steps if k > step]
+            new_records = load_rollouts_aggregated(rollouts_dir, new_steps)
+            scopes.append(("new_data", new_records, new_steps))
+
+        if not scopes:
+            print("  All scopes skipped; nothing to evaluate at this checkpoint.")
             continue
-        pos_recs, neg_recs = split_pos_neg(
-            records, args.positive_score, args.negative_score, args.max_samples_per_class,
-        )
-        print(f"  rollouts @ step {step}: total={len(records)} "
-              f"positives(score=={args.positive_score})={len(pos_recs)} "
-              f"negatives(score=={args.negative_score})={len(neg_recs)}")
 
         # ---- load current model ----
         cur_model = load_model(ckpt_dir, dtype, device)
@@ -326,61 +391,87 @@ def main():
         result = {
             "global_step": step,
             "ckpt_dir": ckpt_dir,
-            "rollouts_file": os.path.join(rollouts_dir, f"{step}.jsonl"),
+            "rollouts_dir": rollouts_dir,
             "init_model_path": args.init_model_path,
             "prev_step": prev_step,
             "positive_score": args.positive_score,
             "negative_score": args.negative_score,
-            "num_rollouts": len(records),
-            "num_positives": len(pos_recs),
-            "num_negatives": len(neg_recs),
+            "history_step_stride": history_stride,
+            "max_samples_per_class": args.max_samples_per_class,
         }
 
-        for tag, recs in [("positive", pos_recs), ("negative", neg_recs)]:
-            if not recs:
-                result[tag] = {"size": 0}
-                print(f"  {tag}: no samples")
-                continue
-            ds = RolloutDataset(
-                recs, tokenizer,
-                max_seq_length=args.max_seq_length,
-                append_eos=args.append_eos,
-                step=step, tag=tag,
+        for scope_name, recs, source_steps in scopes:
+            pos_recs, neg_recs = split_pos_neg(
+                recs, args.positive_score, args.negative_score, args.max_samples_per_class,
             )
-            if len(ds) == 0:
-                print(f"  {tag}: all {len(recs)} samples exceeded max_seq_length, skipping")
-                result[tag] = {
-                    "size": 0,
-                    "size_pre_filter": len(recs),
-                    "skipped_long": ds.skipped_long,
-                }
-                continue
-            loader = DataLoader(
-                ds,
-                batch_size=args.batch_size,
-                shuffle=False,
-                collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            metrics = evaluate_dataset(
-                cur_model, init_model, prev_model, loader, device,
-                do_dead_units=not args.skip_dead_units,
-                epsilon=args.dead_unit_epsilon,
-                dead_threshold=args.dead_unit_threshold,
-                desc=f"{tag}@{step}",
-            )
-            metrics["size"] = len(ds)
-            metrics["size_pre_filter"] = len(recs)
-            metrics["skipped_long"] = ds.skipped_long
-            result[tag] = metrics
-            print(f"  {tag}: n={len(ds)} loss={metrics['loss']:.4f} "
-                  f"ent={metrics['token_entropy']:.3f}"
-                  + (f" kl_init={metrics.get('kl_from_init', float('nan')):.4e}"
-                     if "kl_from_init" in metrics else "")
-                  + (f" kl_prev={metrics.get('kl_from_previous_checkpoint', float('nan')):.4e}"
-                     if "kl_from_previous_checkpoint" in metrics else "")
-                  )
+            print(f"  [{scope_name}] source_steps={len(source_steps)} "
+                  f"total={len(recs)} "
+                  f"pos(score=={args.positive_score})={len(pos_recs)} "
+                  f"neg(score=={args.negative_score})={len(neg_recs)}")
+
+            scope_block = {
+                "num_records": len(recs),
+                "source_steps": source_steps,
+                "num_source_steps": len(source_steps),
+                "num_positives_pre_cap": sum(
+                    1 for r in recs if float(r.get("score", 0.0)) == args.positive_score
+                ),
+                "num_negatives_pre_cap": sum(
+                    1 for r in recs if float(r.get("score", 0.0)) == args.negative_score
+                ),
+            }
+
+            for tag, sub_recs in [("positive", pos_recs), ("negative", neg_recs)]:
+                if not sub_recs:
+                    scope_block[tag] = {"size": 0}
+                    print(f"    {tag}: no samples")
+                    continue
+                ds = RolloutDataset(
+                    sub_recs, tokenizer,
+                    max_seq_length=args.max_seq_length,
+                    append_eos=args.append_eos,
+                    tag=f"{scope_name}/{tag}",
+                )
+                if len(ds) == 0:
+                    print(f"    {tag}: all {len(sub_recs)} samples exceeded max_seq_length, skipping")
+                    scope_block[tag] = {
+                        "size": 0,
+                        "size_pre_filter": len(sub_recs),
+                        "skipped_long": ds.skipped_long,
+                    }
+                    continue
+                loader = DataLoader(
+                    ds,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                )
+                metrics = evaluate_dataset(
+                    cur_model, init_model, prev_model, loader, device,
+                    do_dead_units=not args.skip_dead_units,
+                    epsilon=args.dead_unit_epsilon,
+                    dead_threshold=args.dead_unit_threshold,
+                    desc=f"{scope_name}/{tag}@{step}",
+                )
+                metrics["size"] = len(ds)
+                metrics["size_pre_filter"] = len(sub_recs)
+                metrics["skipped_long"] = ds.skipped_long
+                scope_block[tag] = metrics
+                print(f"    {tag}: n={len(ds)} loss={metrics['loss']:.4f} "
+                      f"ent={metrics['token_entropy']:.3f}"
+                      + (f" kl_init={metrics.get('kl_from_init', float('nan')):.4e}"
+                         if "kl_from_init" in metrics else "")
+                      + (f" kl_to_init={metrics.get('kl_to_init', float('nan')):.4e}"
+                         if "kl_to_init" in metrics else "")
+                      + (f" kl_prev={metrics.get('kl_from_previous_checkpoint', float('nan')):.4e}"
+                         if "kl_from_previous_checkpoint" in metrics else "")
+                      + (f" kl_to_prev={metrics.get('kl_to_previous_checkpoint', float('nan')):.4e}"
+                         if "kl_to_previous_checkpoint" in metrics else "")
+                      )
+
+            result[scope_name] = scope_block
 
         # ---- save ----
         with open(out_path, "w") as f:

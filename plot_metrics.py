@@ -53,7 +53,9 @@ CKPT_SCALAR_FIELDS = [
     "loss",
     "token_entropy",
     "kl_from_init",
+    "kl_to_init",
     "kl_from_previous_checkpoint",
+    "kl_to_previous_checkpoint",
 ]
 
 
@@ -83,8 +85,10 @@ def parse_args():
 
 
 _PRETTY = {
-    "kl_from_init": "KL(p_init || p_curr)",
+    "kl_from_init":                "KL(p_init || p_curr)",
+    "kl_to_init":                  "KL(p_curr || p_init)",
     "kl_from_previous_checkpoint": "KL(p_prev || p_curr)",
+    "kl_to_previous_checkpoint":   "KL(p_curr || p_prev)",
 }
 
 

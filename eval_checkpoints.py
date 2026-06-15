@@ -390,8 +390,10 @@ def evaluate_dataset(
     loss_sum = 0.0
     ent_sum = 0.0
     tok_count = 0
-    kl_init_sum = 0.0
-    kl_prev_sum = 0.0
+    kl_init_sum = 0.0          # KL(p_init || p_cur) -- "what init knew that cur doesn't"
+    kl_cur_init_sum = 0.0      # KL(p_cur  || p_init) -- "what cur is now confident in"
+    kl_prev_sum = 0.0          # KL(p_prev || p_cur)
+    kl_cur_prev_sum = 0.0      # KL(p_cur  || p_prev)
     kl_tok_count = 0
 
     try:
@@ -416,37 +418,52 @@ def evaluate_dataset(
             # Loss = mean NLL over supervised tokens.
             true_lp = cur_logp.gather(-1, shift_labels.clamp_min(0).unsqueeze(-1)).squeeze(-1)
             loss_sum += float((-(true_lp) * sup_mask).sum().item())
+            del true_lp
 
-            # Entropy of current model over supervised positions.
+            # cur_p is reused for entropy AND for reverse KL(p_cur || p_other).
             cur_p = cur_logp.exp()
+
             entropy = -(cur_p * cur_logp).sum(-1)  # (B, T-1)
             ent_sum += float((entropy * sup_mask).sum().item())
-            del cur_p, entropy, true_lp
+            del entropy
             tok_count += n_sup
 
-            # KL from init: KL(p_init || p_cur) summed over supervised positions.
+            # KL vs init.
             if init_model is not None:
                 init_logits = init_model(input_ids=input_ids, attention_mask=attn_mask).logits
                 init_logp = F.log_softmax(init_logits[:, :-1, :].float(), dim=-1)
                 del init_logits
-                init_p = init_logp.exp()
-                kl_init = (init_p * (init_logp - cur_logp)).sum(-1)  # (B, T-1)
-                kl_init_sum += float((kl_init * sup_mask).sum().item())
-                del init_p, kl_init, init_logp
 
+                # Forward: KL(p_init || p_cur) = sum p_init * (log p_init - log p_cur)
+                init_p = init_logp.exp()
+                kl_init = (init_p * (init_logp - cur_logp)).sum(-1)
+                kl_init_sum += float((kl_init * sup_mask).sum().item())
+                del init_p, kl_init
+
+                # Reverse: KL(p_cur || p_init) = sum p_cur * (log p_cur - log p_init)
+                kl_cur_init = (cur_p * (cur_logp - init_logp)).sum(-1)
+                kl_cur_init_sum += float((kl_cur_init * sup_mask).sum().item())
+                del kl_cur_init, init_logp
+
+            # KL vs previous checkpoint.
             if prev_model is not None:
                 prev_logits = prev_model(input_ids=input_ids, attention_mask=attn_mask).logits
                 prev_logp = F.log_softmax(prev_logits[:, :-1, :].float(), dim=-1)
                 del prev_logits
+
                 prev_p = prev_logp.exp()
                 kl_prev = (prev_p * (prev_logp - cur_logp)).sum(-1)
                 kl_prev_sum += float((kl_prev * sup_mask).sum().item())
-                del prev_p, kl_prev, prev_logp
+                del prev_p, kl_prev
+
+                kl_cur_prev = (cur_p * (cur_logp - prev_logp)).sum(-1)
+                kl_cur_prev_sum += float((kl_cur_prev * sup_mask).sum().item())
+                del kl_cur_prev, prev_logp
 
             if init_model is not None or prev_model is not None:
                 kl_tok_count += n_sup
 
-            del cur_logp
+            del cur_p, cur_logp
     finally:
         if tracker is not None:
             tracker.remove()
@@ -458,8 +475,10 @@ def evaluate_dataset(
     }
     if init_model is not None:
         metrics["kl_from_init"] = kl_init_sum / max(kl_tok_count, 1)
+        metrics["kl_to_init"] = kl_cur_init_sum / max(kl_tok_count, 1)
     if prev_model is not None:
         metrics["kl_from_previous_checkpoint"] = kl_prev_sum / max(kl_tok_count, 1)
+        metrics["kl_to_previous_checkpoint"] = kl_cur_prev_sum / max(kl_tok_count, 1)
     if tracker is not None:
         metrics["dead_units"] = tracker.summary()
     return metrics
@@ -782,7 +801,9 @@ def main():
             result["probe"] = probe_metrics
             print(f"  probe: loss={probe_metrics['loss']:.4f} ent={probe_metrics['token_entropy']:.3f}"
                   + (f" kl_init={probe_metrics.get('kl_from_init', float('nan')):.4e}" if "kl_from_init" in probe_metrics else "")
+                  + (f" kl_to_init={probe_metrics.get('kl_to_init', float('nan')):.4e}" if "kl_to_init" in probe_metrics else "")
                   + (f" kl_prev={probe_metrics.get('kl_from_previous_checkpoint', float('nan')):.4e}" if "kl_from_previous_checkpoint" in probe_metrics else "")
+                  + (f" kl_to_prev={probe_metrics.get('kl_to_previous_checkpoint', float('nan')):.4e}" if "kl_to_previous_checkpoint" in probe_metrics else "")
                   )
 
         # ---- old data ----
@@ -824,7 +845,9 @@ def main():
                 result["old_data_step_stride"] = args.old_data_step_stride
                 print(f"  old:   loss={old_metrics['loss']:.4f} ent={old_metrics['token_entropy']:.3f}"
                       + (f" kl_init={old_metrics.get('kl_from_init', float('nan')):.4e}" if "kl_from_init" in old_metrics else "")
+                      + (f" kl_to_init={old_metrics.get('kl_to_init', float('nan')):.4e}" if "kl_to_init" in old_metrics else "")
                       + (f" kl_prev={old_metrics.get('kl_from_previous_checkpoint', float('nan')):.4e}" if "kl_from_previous_checkpoint" in old_metrics else "")
+                      + (f" kl_to_prev={old_metrics.get('kl_to_previous_checkpoint', float('nan')):.4e}" if "kl_to_previous_checkpoint" in old_metrics else "")
                       )
             else:
                 result["old_data_size"] = 0
@@ -867,7 +890,9 @@ def main():
                 result["new_data_step_stride"] = args.old_data_step_stride
                 print(f"  new:   loss={new_metrics['loss']:.4f} ent={new_metrics['token_entropy']:.3f}"
                       + (f" kl_init={new_metrics.get('kl_from_init', float('nan')):.4e}" if "kl_from_init" in new_metrics else "")
+                      + (f" kl_to_init={new_metrics.get('kl_to_init', float('nan')):.4e}" if "kl_to_init" in new_metrics else "")
                       + (f" kl_prev={new_metrics.get('kl_from_previous_checkpoint', float('nan')):.4e}" if "kl_from_previous_checkpoint" in new_metrics else "")
+                      + (f" kl_to_prev={new_metrics.get('kl_to_previous_checkpoint', float('nan')):.4e}" if "kl_to_previous_checkpoint" in new_metrics else "")
                       )
             else:
                 result["new_data_size"] = 0
