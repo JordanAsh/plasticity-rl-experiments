@@ -1,0 +1,136 @@
+description: Countdown SFT (run_sft.py) with LR sweep
+
+target:
+  service: singularity
+  name: msrresrchbasicvc
+  workspace_name: t-jinshen-ws
+
+environment:
+  registry: singularitybase.azurecr.io
+  image: base/job/pytorch/acpt-2.2.1-py3.10-cuda12.1:20240312T225111416
+  setup:
+    # Install verl (and friends) from the locally-uploaded rlvr-weak-supervision repo.
+    # local_dir below is `$CONFIG_DIR/..` so both repos land side-by-side at $$AMLT_CODE_DIR.
+    - cd $$AMLT_CODE_DIR/rlvr-weak-supervision && pip install -e .[vllm]
+    - pip install -U "torchdata>=0.8.0"
+    - pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+    - pip install mlflow math-verify
+    - pip install reasoning-gym
+    - pip uninstall -y huggingface-hub transformers
+    - pip install --no-cache-dir "huggingface-hub>=0.34.0,<1.0" "transformers>=4.56.0,<5"
+    # The prebuilt image ships an old deepspeed that's incompatible with its
+    # torch (ImportError: cannot import name 'log' from
+    # torch.distributed.elastic.agent.server.api). We don't use deepspeed
+    # (plain DDP), and HF's unwrap_model triggers this import on every save.
+    # Drop deepspeed so accelerate falls back to its non-deepspeed path.
+    - pip uninstall -y deepspeed
+
+# Upload BOTH plasticity-rl-experiments/ and rlvr-weak-supervision/ by pointing
+# local_dir at the parent. Aggressively ignore everything else under $HOME.
+code:
+  local_dir: $CONFIG_DIR/..
+  ignore:
+    # Sibling folders we never want to ship (top-level under $HOME)
+    - amlt/
+    - miniconda3/
+    - data/
+    - reward-signal-analysis/
+    - .vscode-server/
+    - .vscode/
+    - .copilot/
+    - .cache/
+    - .conda/
+    - .anaconda/
+    - .local/
+    - .azure/
+    - .azcopy/
+    - .triton/
+    - .config/
+    - .nv/
+    - .ssh/
+    - .gnupg/
+    # plasticity-rl-experiments outputs
+    - plasticity-rl-experiments/results/
+    - plasticity-rl-experiments/eval_results/
+    - plasticity-rl-experiments/eval_results_pass16/
+    - plasticity-rl-experiments/eval_results_pass32/
+    - plasticity-rl-experiments/sft_outputs/
+    - plasticity-rl-experiments/checkpoints/
+    - plasticity-rl-experiments/generation_logs/
+    - plasticity-rl-experiments/wandb/
+    # rlvr-weak-supervision heavy/optional folders
+    - rlvr-weak-supervision/outputs/
+    - rlvr-weak-supervision/data/
+    - rlvr-weak-supervision/LLaMA-Factory/
+    - rlvr-weak-supervision/verl.egg-info/
+    # generic
+    - "**/__pycache__/"
+    - "**/*.pyc"
+    - "**/*.pyo"
+    - "**/.git/"
+    - "**/.venv/"
+    - "**/*.egg-info/"
+    - "**/.DS_Store"
+    - "**/*.log"
+
+storage:
+  mystorageoutput:
+    storage_account_name: tjinshenwsstorage
+    container_name: amulet
+
+# ------------------------------------------------------------------------------
+# Hyperdrive grid sweep. Same pattern as your example: define `params` below
+# and reference them with {name} placeholders in `job_template`. Substituted
+# into both `name` and `command`. Add/remove params freely.
+# ------------------------------------------------------------------------------
+search:
+  job_template:
+    name: cd3b_sft_{ordering}_lr{lr}_seed{seed}_{auto:3s}
+    sku: 40G4-A100
+    sla_tier: Standard
+    identity: managed
+    command:
+      - nvidia-smi
+      - cd $$AMLT_CODE_DIR/plasticity-rl-experiments
+      - export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - export EXPERIMENT_NAME="$$AMLT_JOB_NAME"
+      - export SAVE_DIR="$$AMLT_OUTPUT_DIR"
+      # Convert the {ordering} grid value into the corresponding CLI flag.
+      - if [ "{ordering}" = "ordered" ]; then ORDERED_FLAG="--ordered"; else ORDERED_FLAG=""; fi
+      - >-
+        torchrun --nproc_per_node=4 --master_port=29501 run_sft.py
+        --generation_logs_dir /mnt/mystorageoutput/llama3b_cd_noformat/rollouts/training
+        --model_path meta-llama/Llama-3.2-3B-Instruct
+        --output_dir $$AMLT_OUTPUT_DIR/
+        --lr {lr}
+        --seed {seed}
+        --batch_size 2
+        --effective_batch_size 128
+        --schedule constant
+        --score_threshold 0.5
+        --max_seq_length 2048
+        --num_checkpoints 10
+        --snapshot_dtype bfloat16
+        --no-save_optimizer_state
+        --snapshot_device cpu
+        --max_rl_step 200
+        --grad_clip inf
+        --metrics_log_every 10
+        $$ORDERED_FLAG
+    submit_args:
+      env:
+        _AZUREML_SINGULARITY_JOB_UAI: "/subscriptions/bbd59374-b76d-4cb5-88b6-2be35debc7cf/resourcegroups/t-jinshen/providers/Microsoft.ManagedIdentity/userAssignedIdentities/t-jinshen-ws-uai"
+        HF_TOKEN: $HF_TOKEN
+        HUGGING_FACE_HUB_TOKEN: $HF_TOKEN
+
+  type: hyperdrive
+  sampling: grid
+  max_trials: 1000
+  parallel_trials: 1000
+  params:
+    - name: lr
+      values: [1e-5, 5e-6, 5e-5]
+    - name: seed
+      values: [42]
+    - name: ordering
+      values: [shuffled, ordered]
