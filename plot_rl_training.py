@@ -128,12 +128,19 @@ def _load_metric_across_runs(exp_path: str, metric_rel_path: str,
 
 
 def _moving_average(y: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving average that preserves length without zero-padding the
+    edges. At each position we average over the actual values that fall inside
+    a window of size `window` centered there, so the first/last few points
+    don't get dragged toward zero."""
     if window is None or window <= 1 or y.size == 0:
         return y
-    window = min(window, y.size)
-    kernel = np.ones(window, dtype=float) / float(window)
-    # 'same' keeps the array length; edges are slightly biased toward the mean.
-    return np.convolve(y, kernel, mode="same")
+    n = y.size
+    w = min(window, n)
+    kernel = np.ones(w, dtype=float)
+    # Sum of values and count of contributing samples in each window.
+    num = np.convolve(y, kernel, mode="same")
+    den = np.convolve(np.ones(n, dtype=float), kernel, mode="same")
+    return num / den
 
 
 # ----------------------------- plotting -----------------------------------
