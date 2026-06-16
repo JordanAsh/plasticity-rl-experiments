@@ -10,6 +10,7 @@ Each metric file is whitespace-separated: `<timestamp_ms> <value> <step>`.
 Plots one figure with subplots for:
   - critic/rewards/mean   (training reward)
   - critic/advantages/mean (advantages)
+  - actor/pg_loss
   - actor/kl_loss
   - actor/entropy
   - actor/grad_norm
@@ -42,6 +43,7 @@ plt.rcParams.update(PLOT_STYLE)
 PANELS = [
     ("critic/rewards/mean",     "Training Reward (critic/rewards/mean)", "reward"),
     ("critic/advantages/mean",  "Advantages (critic/advantages/mean)",   "advantage"),
+    ("actor/pg_loss",           "PG Loss (actor/pg_loss)",               "pg_loss"),
     ("actor/kl_loss",           "KL Loss (actor/kl_loss)",               "kl_loss"),
     ("actor/entropy",           "Entropy (actor/entropy)",               "entropy"),
     ("actor/grad_norm",         "Grad Norm (actor/grad_norm)",           "grad_norm"),
