@@ -44,6 +44,12 @@ Usage:
 
 Disable expensive parts via --skip_kl, --skip_dead_units, --skip_in_batch,
 --skip_old_data, --skip_new_data.
+
+Enable per-batch loss matrix via --per_batch_loss: for each stride-eligible
+rollout step j we evaluate the loss of theta_{<=i} on B_j alone, saving
+result["per_batch"][str(j)] = {"all": {...}, "positive": {...}, "negative": {...}}.
+Across checkpoints this gives the matrix L[i, j] = l_{theta_<=i}(B_j) consumed
+by plot_per_batch_loss_matrix.py to render the heatmap.
 """
 
 import argparse
@@ -98,6 +104,11 @@ def parse_args():
                    help="Skip eval on rollouts from earlier stride-eligible steps (k < N).")
     p.add_argument("--skip_new_data", action="store_true",
                    help="Skip eval on rollouts from later stride-eligible steps (k > N).")
+    p.add_argument("--per_batch_loss", action="store_true",
+                   help="For every stride-eligible rollout step j (file {j}.jsonl), evaluate this "
+                        "checkpoint on B_j alone and save per-step metrics under the 'per_batch' "
+                        "key. Together across checkpoints this gives the matrix L[i, j] = loss of "
+                        "theta_{<=i} on B_j. Reuses --history_step_stride (defaults to --step_interval).")
     p.add_argument("--positive_score", type=float, default=1.0,
                    help="Records with score == this value form the 'positive' subset.")
     p.add_argument("--negative_score", type=float, default=0.0,
@@ -472,6 +483,79 @@ def main():
                       )
 
             result[scope_name] = scope_block
+
+        # ---- per-batch loss matrix (one row of L[i, :] for this checkpoint i=step) ----
+        #
+        # For every stride-eligible rollout step j (file {j}.jsonl) we evaluate the
+        # current model on B_j separately, splitting into "all", "positive", and
+        # "negative" subsets. Together across checkpoints this fills the matrix
+        # L[i, j] = loss of theta_{<=i} on B_j (one matrix per polarity).
+        if args.per_batch_loss:
+            # Use the same set of stride-eligible steps as old/new-data aggregation,
+            # plus this checkpoint's own step (so the matrix diagonal i==j is filled).
+            batch_steps = sorted(set(history_steps) | {step})
+            per_batch_out: dict[str, dict] = {}
+            print(f"  per_batch: evaluating {len(batch_steps)} step batches B_j @ checkpoint {step}")
+            for j in batch_steps:
+                j_path = os.path.join(rollouts_dir, f"{j}.jsonl")
+                if not os.path.exists(j_path):
+                    per_batch_out[str(j)] = {"size": 0, "missing": True}
+                    continue
+                j_records = load_rollouts(rollouts_dir, j)
+                j_pos, j_neg = split_pos_neg(
+                    j_records, args.positive_score, args.negative_score,
+                    args.max_samples_per_class,
+                )
+                j_block: dict = {
+                    "num_records": len(j_records),
+                    "num_positives_pre_cap": sum(
+                        1 for r in j_records if float(r.get("score", 0.0)) == args.positive_score
+                    ),
+                    "num_negatives_pre_cap": sum(
+                        1 for r in j_records if float(r.get("score", 0.0)) == args.negative_score
+                    ),
+                }
+                for tag, sub in [("all", j_records), ("positive", j_pos), ("negative", j_neg)]:
+                    if not sub:
+                        j_block[tag] = {"size": 0}
+                        continue
+                    ds_j = RolloutDataset(
+                        sub, tokenizer,
+                        max_seq_length=args.max_seq_length,
+                        append_eos=args.append_eos,
+                        tag=f"per_batch/B{j}/{tag}",
+                    )
+                    if len(ds_j) == 0:
+                        j_block[tag] = {
+                            "size": 0,
+                            "size_pre_filter": len(sub),
+                            "skipped_long": ds_j.skipped_long,
+                        }
+                        continue
+                    loader_j = DataLoader(
+                        ds_j,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+                        num_workers=args.num_workers,
+                        pin_memory=True,
+                    )
+                    m_j = evaluate_dataset(
+                        cur_model, init_model, prev_model, loader_j, device,
+                        do_dead_units=False,
+                        epsilon=args.dead_unit_epsilon,
+                        dead_threshold=args.dead_unit_threshold,
+                        desc=f"B_{j}/{tag}@{step}",
+                    )
+                    m_j.pop("dead_units", None)
+                    m_j["size"] = len(ds_j)
+                    m_j["size_pre_filter"] = len(sub)
+                    m_j["skipped_long"] = ds_j.skipped_long
+                    j_block[tag] = m_j
+                per_batch_out[str(j)] = j_block
+            result["per_batch"] = per_batch_out
+            result["per_batch_steps"] = batch_steps
+            result["per_batch_step_stride"] = history_stride
 
         # ---- save ----
         with open(out_path, "w") as f:

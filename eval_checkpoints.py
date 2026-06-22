@@ -20,6 +20,13 @@ Iterates over checkpoints saved by run_sft.py and, for each, computes:
     - old_data_dead_units
     - (optional) old_data_gradient_norm / variance / noise_scale
 
+  Per-batch (optional, via --per_batch_loss):
+    For every stride-eligible training step j, the loss of this checkpoint i on the
+    single batch B_j is reported under result["per_batch"][str(j)] = {loss,
+    token_entropy, num_supervised_tokens, [kl_*]}. Together across checkpoints this
+    yields the matrix L[i, j] = l_{theta_<=i}(B_j) consumed by
+    plot_per_batch_loss_matrix.py to render the heatmap.
+
 Per-checkpoint results are saved to {ckpt}/eval_metrics.json.
 
 Single-GPU. KL is computed on-the-fly by running init / prev / cur models on the
@@ -41,6 +48,7 @@ import json
 import os
 import re
 import sys
+from collections import defaultdict
 from glob import glob
 from pathlib import Path
 
@@ -86,6 +94,11 @@ def parse_args():
     p.add_argument("--skip_new_data", action="store_true",
                    help="Skip eval on samples first seen AFTER this checkpoint (the symmetric "
                         "counterpart of old-data eval). Uses the same --old_data_step_stride.")
+    p.add_argument("--per_batch_loss", action="store_true",
+                   help="For each stride-eligible training step j, evaluate this checkpoint on the "
+                        "single batch B_j separately and save per-step metrics under the "
+                        "'per_batch' key. Together across checkpoints this gives the matrix "
+                        "L[i, j] = loss of theta_{<=i} on B_j. Uses --old_data_step_stride.")
     p.add_argument("--old_data_step_stride", type=int, default=0,
                    help="If > 0, only include old/new-data samples from training steps that are "
                         "multiples of this stride (e.g. 50 or 100). Reused for both old and new data.")
@@ -189,6 +202,20 @@ def cumulative_seen_per_checkpoint(entries: list[dict], ckpt_steps: list[int],
     for cs in ckpt_steps_sorted[ci:]:
         out[cs] = set(running)
     return out
+
+
+def stride_eligible_step_batches(entries: list[dict], step_stride: int = 0) -> dict[int, set]:
+    """Return {global_step -> set of sample_ids trained at that step} restricted to
+    stride-eligible steps. Each value is the batch B_j (unioned across DDP ranks).
+    """
+    out: dict[int, set] = defaultdict(set)
+    for e in entries:
+        step = e["global_step"]
+        if step_stride > 0 and step % step_stride != 0:
+            continue
+        for mb in e["micro_batches"]:
+            out[step].update(mb["sample_ids"])
+    return dict(out)
 
 
 def future_seen_per_checkpoint(entries: list[dict], ckpt_steps: list[int],
@@ -615,11 +642,20 @@ def gradient_diagnostics(
 # --------------------------- model loading helpers ------------------------
 
 def load_model(path: str, dtype: torch.dtype, device) -> torch.nn.Module:
-    model = AutoModelForCausalLM.from_pretrained(
-        path,
-        torch_dtype=dtype,
-        attn_implementation="flash_attention_2",
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=dtype,
+            attn_implementation="flash_attention_2",
+        )
+    except (ImportError, RuntimeError, OSError) as e:
+        print(f"[load_model] flash_attention_2 unavailable ({type(e).__name__}: {e}); "
+              f"falling back to sdpa.", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=dtype,
+            attn_implementation="sdpa",
+        )
     model.to(device)
     model.eval()
     for p in model.parameters():
@@ -677,10 +713,11 @@ def main():
         )
 
     # ---------- old/new-data dataset (full SFT dataset) ----------
-    need_sft = (not args.skip_old_data) or (not args.skip_new_data)
+    need_sft = (not args.skip_old_data) or (not args.skip_new_data) or args.per_batch_loss
     full_sft_ds = None
     seen_per_ckpt: dict[int, set] = {}
     future_seen_per_ckpt: dict[int, set] = {}
+    step_batches: dict[int, set] = {}
     if need_sft:
         print(f"Reloading SFT positives from {gen_logs_dir} ...")
         positives = load_positives(
@@ -737,6 +774,13 @@ def main():
             if args.old_data_step_stride > 0:
                 sizes = {s: len(future_seen_per_ckpt.get(s, set())) for s, _ in ckpts}
                 print(f"  New-data step stride = {args.old_data_step_stride}; per-ckpt sizes: {sizes}")
+        if args.per_batch_loss:
+            step_batches = stride_eligible_step_batches(
+                entries, step_stride=args.old_data_step_stride,
+            )
+            sizes = {j: len(sids) for j, sids in sorted(step_batches.items())}
+            print(f"  Per-batch loss: {len(step_batches)} stride-eligible step batches B_j; "
+                  f"sizes (sample_ids per step): {sizes}")
 
     # ---------- init model (kept loaded for KL-from-init) ----------
     init_model = None
@@ -896,6 +940,49 @@ def main():
                       )
             else:
                 result["new_data_size"] = 0
+
+        # ---- per-batch loss matrix (one row of L[i, :] for this checkpoint i=step) ----
+        if full_sft_ds is not None and args.per_batch_loss and step_batches:
+            per_batch_out: dict[str, dict] = {}
+            # Precompute sample_id -> dataset_idx map so we don't re-scan items per j.
+            sid_to_idx: dict[str, int] = {
+                it["sample_id"]: i for i, it in enumerate(full_sft_ds.items)
+            }
+            sorted_js = sorted(step_batches.keys())
+            print(f"  per_batch: evaluating {len(sorted_js)} step batches B_j @ checkpoint {step}")
+            for j in sorted_js:
+                sids = step_batches[j]
+                b_idx = [sid_to_idx[s] for s in sids if s in sid_to_idx]
+                if not b_idx:
+                    per_batch_out[str(j)] = {"size": 0}
+                    continue
+                b_subset = Subset(full_sft_ds, b_idx)
+                b_subset.items = [full_sft_ds.items[i] for i in b_idx]
+                b_subset.eos_ids = full_sft_ds.eos_ids
+                b_loader = DataLoader(
+                    b_subset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                )
+                # Per-batch eval: loss + entropy + optional KL. Skip dead-units
+                # (model-level and already covered by old/new/probe).
+                b_metrics = evaluate_dataset(
+                    cur_model, init_model, prev_model, b_loader, device,
+                    do_dead_units=False,
+                    epsilon=args.dead_unit_epsilon,
+                    dead_threshold=args.dead_unit_threshold,
+                    desc=f"B_{j}@{step}",
+                )
+                # Strip dead-units placeholder if any, keep things compact.
+                b_metrics.pop("dead_units", None)
+                b_metrics["size"] = len(b_idx)
+                per_batch_out[str(j)] = b_metrics
+            result["per_batch"] = per_batch_out
+            result["per_batch_step_stride"] = args.old_data_step_stride
+            result["per_batch_steps"] = sorted_js
 
         # ---- save ----
         with open(out_path, "w") as f:
